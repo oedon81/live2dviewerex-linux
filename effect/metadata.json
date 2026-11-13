@@ -1,0 +1,14 @@
+{
+    "KPackageStructure": "KWin/Effect",
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "X-KDE-Ordering": 99,
+    "KPlugin": {
+        "Id": "live2dviewerex-hide",
+        "Name": "Live2DViewerEX: hide the real window",
+        "Description": "Stops drawing the Live2DViewerEX wallpaper window on screen; the \"Live2DViewerEX (live)\" wallpaper shows its picture instead",
+        "Category": "Appearance",
+        "License": "MIT",
+        "EnabledByDefault": false
+    }
+}

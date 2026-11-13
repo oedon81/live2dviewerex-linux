@@ -1,0 +1,11 @@
+{
+    "KPackageStructure": "Plasma/Wallpaper",
+    "KPlugin": {
+        "Id": "local.live2dviewerex.stream",
+        "Name": "Live2DViewerEX (live)",
+        "Description": "Shows the running Live2DViewerEX wallpaper behind the desktop icons and passes clicks on to it",
+        "Icon": "preferences-desktop-wallpaper",
+        "License": "MIT"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

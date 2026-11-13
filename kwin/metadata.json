@@ -1,0 +1,12 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "KPlugin": {
+        "Id": "live2dviewerex-wallpaper",
+        "Name": "Live2DViewerEX wallpaper helper",
+        "Description": "Keeps the Live2DViewerEX wallpaper window out of sight for the \"Live2DViewerEX (live)\" wallpaper and tells the viewer where the cursor is (Meta+Alt+L shows the real window)",
+        "License": "MIT",
+        "EnabledByDefault": true
+    }
+}

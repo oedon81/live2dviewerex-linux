@@ -1,0 +1,410 @@
+#!/usr/bin/python3 -I
+"""l2dex-bridge - the Plasma desktop's line to Live2DViewerEX (Steam/Proton).
+
+On Windows the viewer's tray program reads the mouse with a global hook and passes it to the Unity player as
+JSON messages over a local WebSocket (ws://127.0.0.1:<bin/app_port>). The hook sees nothing under Wine/Wayland
+unless the cursor is over a Wine window, so this bridge sends the very same messages instead, and gives the
+viewer a native tray icon and menu in place of the one Wine draws.
+
+    D-Bus  local.l2dex.Bridge  /Bridge
+      Event(s)    pointer input, space separated tokens, several per call allowed:
+                    p X Y H   cursor at X,Y from the top-left of all screens, H = their total height
+                    P X Y H   the same, and the cursor is over the bare desktop: Wine's cursor is moved too
+                    d  u      left button down / up          rd  ru   right button down / up
+                    wu wd     wheel up / down
+      Action(s)   what the tray menu does: panel adjust pause fps restart settings instancemanager exstudio
+                  motiontracker manual log exit
+      Status()    -> (connected, port)        Quit()
+
+Callers: the KWin script (cursor), the wallpaper plugin (buttons, wheel), Plasma's system tray (menu).
+Out: JSON messages to the viewer; "c X Y" / "run NAME" datagrams to progman_shim.exe inside Wine (see there).
+Started on demand by D-Bus activation; exits by itself once the viewer has been gone for IDLE_EXIT seconds.
+Needs only the system Python with PyGObject (Gio); the WebSocket client below is plain standard library.
+"""
+import base64, json, os, socket, struct, subprocess, sys
+
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+
+NAME, PATH = os.environ.get('L2DEX_BUS_NAME') or 'local.l2dex.Bridge', '/Bridge'     # other name/port: tests only
+def _app_dir():      # install.sh writes the folder it found into ~/.config/l2dex/app_dir
+    try:
+        with open(os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'), 'l2dex', 'app_dir')) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+APP_DIR = os.environ.get('L2DEX_DIR') or _app_dir() or os.path.expanduser('~/.local/share/Steam/steamapps/common/Live2DViewerEX')
+PORT_FILE = os.path.join(APP_DIR, 'bin', 'app_port')
+SETTINGS = os.path.join(APP_DIR, 'bin', 'system.dat')       # the tray program's settings, plain JSON
+SHIM = ('127.0.0.1', int(os.environ.get('L2DEX_SHIM_PORT') or 48398))
+RETRY_MS, IDLE_EXIT = 2000, 20
+VERBOSE = bool(os.environ.get('L2DEX_DEBUG'))
+TRAY = 2000000      # added to a message number, the player hands the message on to the tray program (lwtray)
+
+BUTTONS = {'d': (1910, True), 'u': (1911, None), 'rd': (1912, None), 'ru': (1913, None), 'wd': (1916, None), 'wu': (1917, None)}
+
+XML = """<node><interface name='local.l2dex.Bridge'>
+  <method name='Event'><arg type='s' name='tokens' direction='in'/></method>
+  <method name='Action'><arg type='s' name='name' direction='in'/></method>
+  <method name='Status'><arg type='b' name='connected' direction='out'/><arg type='i' name='port' direction='out'/></method>
+  <method name='Quit'/>
+</interface></node>"""
+
+SNI_XML = """<node><interface name='org.kde.StatusNotifierItem'>
+  <property name='Category' type='s' access='read'/><property name='Id' type='s' access='read'/>
+  <property name='Title' type='s' access='read'/><property name='Status' type='s' access='read'/>
+  <property name='WindowId' type='i' access='read'/><property name='IconName' type='s' access='read'/>
+  <property name='IconThemePath' type='s' access='read'/><property name='ToolTip' type='(sa(iiay)ss)' access='read'/>
+  <property name='ItemIsMenu' type='b' access='read'/><property name='Menu' type='o' access='read'/>
+  <method name='Activate'><arg type='i' direction='in'/><arg type='i' direction='in'/></method>
+  <method name='SecondaryActivate'><arg type='i' direction='in'/><arg type='i' direction='in'/></method>
+  <method name='ContextMenu'><arg type='i' direction='in'/><arg type='i' direction='in'/></method>
+  <method name='Scroll'><arg type='i' direction='in'/><arg type='s' direction='in'/></method>
+  <signal name='NewTitle'/><signal name='NewIcon'/><signal name='NewToolTip'/>
+  <signal name='NewStatus'><arg type='s'/></signal>
+</interface></node>"""
+
+MENU_XML = """<node><interface name='com.canonical.dbusmenu'>
+  <property name='Version' type='u' access='read'/><property name='TextDirection' type='s' access='read'/>
+  <property name='Status' type='s' access='read'/><property name='IconThemePath' type='as' access='read'/>
+  <method name='GetLayout'><arg type='i' direction='in'/><arg type='i' direction='in'/><arg type='as' direction='in'/>
+    <arg type='u' direction='out'/><arg type='(ia{sv}av)' direction='out'/></method>
+  <method name='GetGroupProperties'><arg type='ai' direction='in'/><arg type='as' direction='in'/><arg type='a(ia{sv})' direction='out'/></method>
+  <method name='GetProperty'><arg type='i' direction='in'/><arg type='s' direction='in'/><arg type='v' direction='out'/></method>
+  <method name='Event'><arg type='i' direction='in'/><arg type='s' direction='in'/><arg type='v' direction='in'/><arg type='u' direction='in'/></method>
+  <method name='EventGroup'><arg type='a(isvu)' direction='in'/><arg type='ai' direction='out'/></method>
+  <method name='AboutToShow'><arg type='i' direction='in'/><arg type='b' direction='out'/></method>
+  <method name='AboutToShowGroup'><arg type='ai' direction='in'/><arg type='ai' direction='out'/><arg type='ai' direction='out'/></method>
+  <signal name='ItemsPropertiesUpdated'><arg type='a(ia{sv})'/><arg type='a(ias)'/></signal>
+  <signal name='LayoutUpdated'><arg type='u'/><arg type='i'/></signal>
+  <signal name='ItemActivationRequested'><arg type='i'/><arg type='u'/></signal>
+</interface></node>"""
+
+# tray menu: (action, label, icon); None = separator. "pause" changes its label while paused.
+MENU = [('panel', 'Control Panel', 'configure'), ('adjust', 'Adjust Model', 'transform-move'),
+        ('pause', 'Pause', 'media-playback-pause'), ('fps', 'Frame Rate: Match Monitor', 'speedometer'),
+        ('restart', 'Restart', 'view-refresh'), None,
+        ('settings', 'Settings…', 'preferences-system'), ('instancemanager', 'Instance Manager', 'window-duplicate'),
+        ('exstudio', 'EX Studio', 'applications-graphics'), ('motiontracker', 'Motion Tracker', 'camera-web'), None,
+        ('manual', 'User Manual', 'help-contents'), ('log', 'Log Folder', 'folder-log'), None,
+        ('exit', 'Exit', 'application-exit')]
+
+
+def log(*a):
+    if VERBOSE: print('l2dex-bridge:', *a, file=sys.stderr, flush=True)
+
+
+def setting(name, default=0):
+    try:
+        with open(SETTINGS, encoding='utf-8-sig') as f: return json.load(f).get(name, default)
+    except (OSError, ValueError):
+        return default
+
+
+def monitor_hz():
+    """Refresh rate of the main enabled screen, as Plasma has it set (0 if it cannot be read)."""
+    try:
+        outs = json.loads(subprocess.run(['kscreen-doctor', '-j'], capture_output=True, timeout=5).stdout)['outputs']
+        outs = sorted((o for o in outs if o.get('enabled')), key=lambda o: o.get('priority') or 99)
+        return round(next(m['refreshRate'] for m in outs[0]['modes'] if m['id'] == outs[0]['currentModeId']))
+    except (OSError, ValueError, KeyError, IndexError, StopIteration, subprocess.SubprocessError):
+        return 0
+
+
+class Viewer:
+    """Minimal RFC 6455 client: text frames out; pings answered; everything else that comes in is dropped."""
+
+    def __init__(self, changed):
+        self.sock, self.port, self.buf, self.watch, self.changed = None, 0, b'', 0, changed
+
+    def connected(self): return self.sock is not None
+
+    def connect(self):
+        try:
+            with open(PORT_FILE) as f: port = int(f.read().strip())
+        except (OSError, ValueError):
+            return False
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        try:
+            s.connect(('127.0.0.1', port))
+            key = base64.b64encode(os.urandom(16)).decode()
+            s.sendall((f'GET /api HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                       f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n').encode())
+            head = b''
+            while b'\r\n\r\n' not in head:
+                chunk = s.recv(4096)
+                if not chunk: raise OSError('closed during handshake')
+                head += chunk
+                if len(head) > 65536: raise OSError('handshake too long')
+            head, rest = head.split(b'\r\n\r\n', 1)
+            if b' 101 ' not in head.split(b'\r\n', 1)[0]: raise OSError('not a WebSocket endpoint: %r' % head[:60])
+        except OSError as e:
+            log('connect', port, 'failed:', e)
+            s.close()
+            return False
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.settimeout(1.0)
+        self.sock, self.port, self.buf = s, port, rest
+        self.watch = GLib.io_add_watch(s.fileno(), GLib.PRIORITY_DEFAULT,
+                                       GLib.IOCondition.IN | GLib.IOCondition.HUP | GLib.IOCondition.ERR, self._readable)
+        log('connected to viewer on port', port)
+        self.changed()
+        return True
+
+    def close(self):
+        if self.watch: GLib.source_remove(self.watch)
+        was = self.sock
+        if was:
+            try: was.close()
+            except OSError: pass
+            log('viewer connection closed')
+        self.sock, self.watch, self.buf = None, 0, b''
+        if was: self.changed()
+
+    def _frame(self, opcode, payload=b''):
+        mask, n = os.urandom(4), len(payload)
+        head = bytes([0x80 | opcode]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack('>H', n)
+                                         if n < 65536 else bytes([0x80 | 127]) + struct.pack('>Q', n))
+        try:
+            self.sock.sendall(head + mask + bytes(b ^ mask[i & 3] for i, b in enumerate(payload)))
+            return True
+        except OSError as e:
+            log('send failed:', e)
+            self.close()
+            return False
+
+    def send(self, msg, data=None):
+        if not self.sock: return False
+        obj = {'msg': msg} if data is None else {'msg': msg, 'data': data}
+        return self._frame(0x1, json.dumps(obj, separators=(',', ':')).encode())
+
+    def _readable(self, fd, cond):
+        try:
+            chunk = self.sock.recv(65536, socket.MSG_DONTWAIT) if cond & GLib.IOCondition.IN else b''
+        except BlockingIOError:
+            return True
+        except OSError:
+            chunk = b''
+        if not chunk:
+            self.watch = 0
+            self.close()
+            return False
+        self.buf += chunk
+        while len(self.buf) >= 2:                       # server frames are never masked
+            op, n, off = self.buf[0] & 0x0F, self.buf[1] & 0x7F, 2
+            if n == 126:
+                if len(self.buf) < 4: break
+                n, off = struct.unpack('>H', self.buf[2:4])[0], 4
+            elif n == 127:
+                if len(self.buf) < 10: break
+                n, off = struct.unpack('>Q', self.buf[2:10])[0], 10
+            if len(self.buf) < off + n: break
+            payload, self.buf = self.buf[off:off + n], self.buf[off + n:]
+            if op == 0x9:                               # ping: the server drops clients that do not answer
+                if not self._frame(0xA, payload): return False
+            elif op == 0x8:
+                self.watch = 0
+                self.close()
+                return False
+        return True
+
+
+class Tray:
+    """StatusNotifierItem + DBusMenu: Plasma draws the icon and the menu itself, in the desktop's own style."""
+    ITEM, MENUPATH = '/StatusNotifierItem', '/MenuBar'
+
+    def __init__(self, bridge):
+        self.bridge, self.conn, self.revision = bridge, None, 1
+
+    def export(self, conn):
+        self.conn = conn
+        conn.register_object(self.ITEM, Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0], self._item_call, self._item_prop, None)
+        conn.register_object(self.MENUPATH, Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0], self._menu_call, self._menu_prop, None)
+        # (re)register whenever the tray host shows up, e.g. after plasmashell restarts
+        Gio.bus_watch_name_on_connection(conn, 'org.kde.StatusNotifierWatcher', Gio.BusNameWatcherFlags.NONE,
+                                         lambda c, n, o: self._register(), None)
+
+    def _register(self):
+        self.conn.call('org.kde.StatusNotifierWatcher', '/StatusNotifierWatcher', 'org.kde.StatusNotifierWatcher',
+                       'RegisterStatusNotifierItem', GLib.Variant('(s)', (self.conn.get_unique_name(),)),
+                       None, Gio.DBusCallFlags.NONE, 3000, None, None)
+
+    def status(self):
+        return 'Active' if self.bridge.viewer.connected() else 'Passive'
+
+    def refresh(self):                                  # connection or pause state changed
+        if not self.conn: return
+        self.revision += 1
+        self.conn.emit_signal(None, self.ITEM, 'org.kde.StatusNotifierItem', 'NewStatus', GLib.Variant('(s)', (self.status(),)))
+        self.conn.emit_signal(None, self.MENUPATH, 'com.canonical.dbusmenu', 'LayoutUpdated', GLib.Variant('(ui)', (self.revision, 0)))
+
+    def _item_prop(self, conn, sender, path, iface, prop):
+        return {'Category': GLib.Variant('s', 'ApplicationStatus'), 'Id': GLib.Variant('s', 'live2dviewerex'),
+                'Title': GLib.Variant('s', 'Live2DViewerEX'), 'Status': GLib.Variant('s', self.status()),
+                'WindowId': GLib.Variant('i', 0), 'IconName': GLib.Variant('s', 'steam_icon_616720'),
+                'IconThemePath': GLib.Variant('s', ''), 'ItemIsMenu': GLib.Variant('b', False),
+                'ToolTip': GLib.Variant('(sa(iiay)ss)', ('', [], 'Live2DViewerEX', '')),
+                'Menu': GLib.Variant('o', self.MENUPATH)}.get(prop)
+
+    def _item_call(self, conn, sender, path, iface, method, params, inv):
+        if method == 'Activate': self.bridge.action('panel')        # like a double click on the Windows tray icon
+        inv.return_value(None)
+
+    def _props(self, i):
+        if i == 0: return {'children-display': GLib.Variant('s', 'submenu')}
+        entry = MENU[i - 1] if 0 < i <= len(MENU) else None
+        if entry is None: return {'type': GLib.Variant('s', 'separator')}
+        action, label, icon = entry
+        if action == 'pause' and self.bridge.paused: label, icon = 'Resume', 'media-playback-start'
+        return {'label': GLib.Variant('s', label), 'icon-name': GLib.Variant('s', icon),
+                'enabled': GLib.Variant('b', self.bridge.viewer.connected())}
+
+    def _layout(self, i):
+        kids = [GLib.Variant('(ia{sv}av)', (k, self._props(k), [])) for k in range(1, len(MENU) + 1)] if i == 0 else []
+        return (i, self._props(i), kids)
+
+    def _menu_prop(self, conn, sender, path, iface, prop):
+        return {'Version': GLib.Variant('u', 3), 'TextDirection': GLib.Variant('s', 'ltr'),
+                'Status': GLib.Variant('s', 'normal'), 'IconThemePath': GLib.Variant('as', [])}.get(prop)
+
+    def _clicked(self, i, event):
+        if event == 'clicked' and 0 < i <= len(MENU) and MENU[i - 1]: self.bridge.action(MENU[i - 1][0])
+
+    def _menu_call(self, conn, sender, path, iface, method, params, inv):
+        a = params.unpack()
+        if method == 'GetLayout':
+            inv.return_value(GLib.Variant('(u(ia{sv}av))', (self.revision, self._layout(a[0]))))
+        elif method == 'GetGroupProperties':
+            ids = a[0] or range(len(MENU) + 1)
+            inv.return_value(GLib.Variant('(a(ia{sv}))', ([(i, self._props(i)) for i in ids],)))
+        elif method == 'GetProperty':
+            inv.return_value(GLib.Variant('(v)', (self._props(a[0]).get(a[1], GLib.Variant('s', '')),)))
+        elif method == 'Event':
+            self._clicked(a[0], a[1])
+            inv.return_value(None)
+        elif method == 'EventGroup':
+            for i, event, _data, _time in a[0]: self._clicked(i, event)
+            inv.return_value(GLib.Variant('(ai)', ([],)))
+        elif method == 'AboutToShow':
+            inv.return_value(GLib.Variant('(b)', (False,)))
+        elif method == 'AboutToShowGroup':
+            inv.return_value(GLib.Variant('(aiai)', ([], [])))
+
+
+class Bridge:
+    def __init__(self):
+        self.loop, self.idle, self.left, self.right, self.paused = GLib.MainLoop(), 0, False, False, False
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.tray = Tray(self)
+        self.viewer = Viewer(self._changed)
+        self.node = Gio.DBusNodeInfo.new_for_xml(XML)
+
+    def run(self):
+        Gio.bus_own_name(Gio.BusType.SESSION, NAME, Gio.BusNameOwnerFlags.DO_NOT_QUEUE,
+                         self._bus, None, lambda *_: self.loop.quit())
+        GLib.timeout_add(RETRY_MS, self._tick)
+        self.loop.run()
+        self._release()
+        self.viewer.close()
+
+    def _bus(self, conn, name):
+        conn.register_object(PATH, self.node.interfaces[0], self._call, None, None)
+        self.tray.export(conn)
+        self.viewer.connect()
+
+    def _changed(self):                                 # viewer connected or gone
+        self.left = self.right = self.paused = False
+        self.tray.refresh()
+        if self.viewer.connected(): GLib.timeout_add_seconds(6, self._settle, self.viewer.port)
+
+    def _settle(self, port):
+        # "Desktop position: top" makes the viewer take every click anywhere - also on its own Control Panel -
+        # as a click on the model (there it floats above all windows). Here it is the wallpaper: bottom.
+        if self.viewer.connected() and self.viewer.port == port and setting('desktopPosition', -1) == 0:
+            log('desktop position top -> bottom')
+            self.viewer.send(TRAY + 9401, 1)
+        return False
+
+    def _tick(self):
+        if self.viewer.connected() or self.viewer.connect():
+            self.idle = 0
+        else:
+            self.idle += RETRY_MS / 1000
+            if self.idle >= IDLE_EXIT:
+                log('viewer gone, exiting')
+                self.loop.quit()
+        return True
+
+    def _release(self):                                 # never leave a button held down in the viewer
+        if self.left: self.viewer.send(1911)
+        if self.right: self.viewer.send(1913)
+        self.left = self.right = False
+
+    def _shim(self, text):
+        try: self.udp.sendto(text.encode(), SHIM)
+        except OSError as e: log('shim:', e)
+
+    def event(self, text):
+        t = text.split()
+        i = 0
+        while i < len(t):
+            k = t[i]
+            if k in ('p', 'P') and i + 3 < len(t):
+                try:
+                    x, y, h = int(float(t[i + 1])), int(float(t[i + 2])), int(float(t[i + 3]))
+                    self.viewer.send(1918, [1, x, h - y])
+                    if k == 'P': self._shim(f'c {x} {y}')
+                except ValueError: pass
+                i += 4
+                continue
+            if k in BUTTONS:
+                if k == 'd': self.left = True
+                elif k == 'u': self.left = False
+                elif k == 'rd': self.right = True
+                elif k == 'ru': self.right = False
+                self.viewer.send(*BUTTONS[k])
+                log('event', k)
+            i += 1
+
+    def action(self, name):
+        log('action', name)
+        v = self.viewer
+        if name == 'panel': self._shim('run lwui')
+        elif name in ('exstudio', 'motiontracker', 'instancemanager'): self._shim('run ' + name)
+        elif name == 'adjust': v.send(3900, True)
+        elif name == 'pause':
+            if v.send(1991) if self.paused else v.send(1990, True):
+                self.paused = not self.paused
+                self.tray.refresh()
+        elif name == 'fps':
+            # The viewer's "VSync" mode is paced by an Xwayland timer (about 59 fps), and its Control Panel slider
+            # stops at 120. The player itself takes any rate: "Custom" mode (9114 = 0) at the screen's rate (9115).
+            hz = monitor_hz()
+            log('frame rate ->', hz)
+            if hz > 0: v.send(9114, 0); v.send(9115, hz)
+        elif name == 'restart': v.send(TRAY + 1992, setting('launchMode', 1))
+        elif name == 'settings': v.send(TRAY + 1301)
+        elif name == 'exit': v.send(TRAY + 1999)
+        elif name == 'manual': Gio.AppInfo.launch_default_for_uri('http://live2d.pavostudio.com/doc/?lang=en-US', None)
+        elif name == 'log': Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(os.path.join(APP_DIR, 'bin', 'log'), None), None)
+
+    def _call(self, conn, sender, path, iface, method, params, inv):
+        if method == 'Event':
+            self.event(params.unpack()[0])
+            inv.return_value(None)
+        elif method == 'Action':
+            self.action(params.unpack()[0])
+            inv.return_value(None)
+        elif method == 'Status':
+            inv.return_value(GLib.Variant('(bi)', (self.viewer.connected(), self.viewer.port)))
+        elif method == 'Quit':
+            inv.return_value(None)
+            self.loop.quit()
+
+
+if __name__ == '__main__':
+    Bridge().run()

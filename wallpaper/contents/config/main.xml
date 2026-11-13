@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0">
+  <kcfgfile name=""/>
+  <group name="General">
+    <!-- written by the KWin script "live2dviewerex-wallpaper" while the viewer runs; empty otherwise -->
+    <entry name="WindowUuid" type="String"><default></default></entry>
+    <!-- picture shown while the viewer is not running (path or file:// URL) -->
+    <entry name="FallbackImage" type="String"><default></default></entry>
+    <entry name="FallbackColor" type="Color"><default>#000000</default></entry>
+    <!-- Image.fillMode: 2 = scaled and cropped, 1 = scaled to fit, 0 = stretched -->
+    <entry name="FillMode" type="Int"><default>2</default></entry>
+    <entry name="ForwardClicks" type="Bool"><default>true</default></entry>
+    <entry name="ForwardRightClicks" type="Bool"><default>true</default></entry>
+    <entry name="ForwardWheel" type="Bool"><default>true</default></entry>
+  </group>
+</kcfg>
